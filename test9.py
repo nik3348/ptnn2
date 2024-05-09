@@ -9,13 +9,14 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 episodes = 1000
-seq_length = 64
+seq_length = 32
 batch_size = 128
+skip_frame = 4
 decay_factor = 0.99
 learning_rate = 1e-4
-epsilon = 1.0
+epsilon = 0.0
 isLoad = True
-human = True
+isHuman = True
 name = "Breakout1-4"
 model_path = f"models/{name}"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -157,16 +158,21 @@ class LSTM_DQN(nn.Module):
         super(LSTM_DQN, self).__init__()
         self.hidden_size = hidden_size
         self.fc1 = nn.Linear(1003, input_size)
+        self.ln_fc1 = nn.LayerNorm(input_size)  # LayerNorm for fc1 output
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True, device=device)
         self.fc2 = nn.Linear(hidden_size, hidden_size, device=device)
+        self.ln_fc2 = nn.LayerNorm(hidden_size)  # LayerNorm for fc2 output
         self.vn = nn.Linear(hidden_size, 1, device=device)
         self.an = nn.Linear(hidden_size, output_size, device=device)
 
     def forward(self, input, hidden):
         output = self.fc1(input)
+        output = self.ln_fc1(output)
         output, hidden = self.lstm(output, hidden)
         output = output[:, -1, :]
-        output = torch.relu(self.fc2(output))
+        output = self.fc2(output)
+        output = self.ln_fc2(output)
+        output = torch.relu(output)
 
         advantage = self.an(output)
         state_value = self.vn(output)
@@ -299,6 +305,7 @@ class DQNAgent:
         torch.save(self.policy_net, model_path + "1" + ".pt")
         torch.save(self.target_net, model_path + "2" + ".pt")
 
+
 def normalize(state):
     max_pixel_value = torch.max(state)
     normalized_image_tensor = state / max_pixel_value
@@ -307,8 +314,9 @@ def normalize(state):
     std_pixel_value = torch.std(normalized_image_tensor)
     return (normalized_image_tensor - mean_pixel_value) / std_pixel_value
 
+
 if __name__ == "__main__":
-    env = gym.make("ALE/Breakout-v5", render_mode="human" if human else "rgb_array")
+    env = gym.make("ALE/Breakout-v5", render_mode="human" if isHuman else "rgb_array")
     writer = SummaryWriter()
     input_size = env.observation_space.shape[0]
     output_size = env.action_space.n
@@ -316,10 +324,10 @@ if __name__ == "__main__":
     resnet = ResNet().to(device)
     agent = DQNAgent(128, hidden_size=128, output_size=output_size, epsilon=epsilon)
 
+    supreme_buffer = PrioritizedReplayBuffer(capacity=10000)
     if isLoad:
         agent.load()
         supreme_buffer = torch.load("buffer_alpha.pt")
-        # supreme_buffer = PrioritizedReplayBuffer(capacity=10000)
 
     for episode in range(episodes):
         buffer = PrioritizedReplayBuffer(capacity=10000)
@@ -340,40 +348,46 @@ if __name__ == "__main__":
         total_reward = 0
 
         while not done:
-            time_step += 1
+            if time_step % skip_frame == 0:
+                action = agent.select_action(state)
+                next_state, reward, terminated, truncated, info = env.step(action)
 
-            action = agent.select_action(state)
-            next_state, reward, terminated, truncated, info = env.step(action)
+                total_reward += reward
+                if reward == 0:
+                    reward -= 1
 
-            total_reward += reward
-            if reward == 0:
-                reward -= 1
+                next_state = torch.FloatTensor(next_state).to(device)
+                next_state = normalize(next_state)
+                next_state = resnet(next_state)
+                next_state = torch.cat(
+                    (next_state, torch.tensor([reward, time_step, action]).to(device)),
+                    dim=0,
+                )
 
-            next_state = torch.FloatTensor(next_state).to(device)
-            next_state = normalize(next_state)
-            next_state = resnet(next_state)
-            next_state = torch.cat(
-                (next_state, torch.tensor([reward, time_step, action]).to(device)),
-                dim=0,
-            )
+                next = state.copy()
+                next.append(next_state.cpu().detach().numpy())
+                if len(next) > seq_length:
+                    next.pop(0)
+                next_state = next
 
-            next = state.copy()
-            next.append(next_state.cpu().detach().numpy())
-            if len(next) > seq_length:
-                next.pop(0)
-            next_state = next
+                done = terminated or truncated
 
-            done = terminated or truncated
+                buffer.add((state, action, reward, next_state, done))
+                state = next_state
+                time_step += 1
 
-            buffer.add((state, action, reward, next_state, done))
-            state = next_state
+            else:
+                _, _, _, _, _ = env.step(action)
+                time_step += 1
 
         loss = agent.train(buffer)
         writer.add_scalar(f"{name}/loss", loss, episode)
         writer.add_scalar(f"{name}/total_reward", total_reward, episode)
 
         if episode % 10 == 0:
-            print(f"Progress: {episode * 100/episodes}%, Total Reward: {total_reward}")
+            print(
+                f"Progress: {round(episode * 100/episodes, 2)}%, Total Reward: {total_reward}"
+            )
             agent.save()
 
         if total_reward >= 11:
